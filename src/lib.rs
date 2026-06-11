@@ -149,7 +149,7 @@ pub async fn open(
     let _mdns_guard = if local_only {
         None
     } else {
-        match mdns::announce(&t.name).await {
+        match mdns::announce(&t.name, edge_port) {
             Ok(g) => Some(g),
             Err(e) => {
                 eprintln!("warning: mDNS announce failed ({e}); LAN devices must use the IP");
@@ -179,15 +179,12 @@ async fn start_lan_edge<O: edge::Opener>(
     edge_port: u16,
 ) -> Result<SocketAddr> {
     let lan_ip = *mdns::lan_ips()?.first().expect("lan_ips is non-empty");
-    let responder = mdns::announce(name).await?;
     let (ready_tx, ready_rx) = oneshot::channel();
-    let name = name.to_string();
-    tokio::spawn(async move {
-        // Keep the mDNS responder alive for the lifetime of the edge.
-        let _responder = responder;
+    let edge_name = name.to_string();
+    let edge_task = tokio::spawn(async move {
         if let Err(e) = edge::run(
             opener,
-            name,
+            edge_name,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port),
             ready_tx,
         )
@@ -199,6 +196,14 @@ async fn start_lan_edge<O: edge::Opener>(
     let bound = ready_rx
         .await
         .map_err(|_| anyhow::anyhow!("LAN edge failed to start"))?;
+    // Announce only once the edge is actually listening, with the real port.
+    let responder = mdns::announce(name, bound.port())?;
+    tokio::spawn(async move {
+        // Tie the registration's lifetime to the edge: dropping the guard
+        // unregisters the name.
+        let _responder = responder;
+        edge_task.await.ok();
+    });
     Ok(SocketAddr::new(lan_ip, bound.port()))
 }
 
