@@ -136,7 +136,7 @@ async fn listing(root: &Path, dir: &Path) -> Result<String> {
         };
         entries.push((is_dir, name, size));
     }
-    entries.sort_by(|a, b| (!a.0, a.1.to_lowercase()).cmp(&(!b.0, b.1.to_lowercase())));
+    entries.sort_by_key(|e| (!e.0, e.1.to_lowercase()));
 
     let mut rows = String::new();
     if rel.components().next().is_some() {

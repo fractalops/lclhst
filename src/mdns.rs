@@ -16,13 +16,13 @@ const TTL: u32 = 60;
 
 /// Announce `<name>.local` → this machine's LAN IP(s). The responder
 /// answers queries for as long as the returned guard is alive.
-pub fn announce(name: &str) -> Result<SimpleMdnsResponder> {
+pub async fn announce(name: &str) -> Result<SimpleMdnsResponder> {
     let ips = lan_ips()?;
-    announce_ips(name, &ips)
+    announce_ips(name, &ips).await
 }
 
 /// Like [`announce`], with explicit addresses (testable without a NIC).
-pub fn announce_ips(name: &str, ips: &[IpAddr]) -> Result<SimpleMdnsResponder> {
+pub async fn announce_ips(name: &str, ips: &[IpAddr]) -> Result<SimpleMdnsResponder> {
     ensure!(valid_name(name), "invalid tunnel name: {name:?}");
     ensure!(!ips.is_empty(), "no LAN address to announce");
     let fqdn = format!("{name}.local");
@@ -35,7 +35,9 @@ pub fn announce_ips(name: &str, ips: &[IpAddr]) -> Result<SimpleMdnsResponder> {
             IpAddr::V4(v4) => RData::A(A::from(*v4)),
             IpAddr::V6(v6) => RData::AAAA(AAAA::from(*v6)),
         };
-        responder.add_resource(ResourceRecord::new(dns_name.clone(), CLASS::IN, TTL, rdata));
+        responder
+            .add_resource(ResourceRecord::new(dns_name.clone(), CLASS::IN, TTL, rdata))
+            .await;
     }
     Ok(responder)
 }
@@ -65,16 +67,16 @@ pub fn lan_ips() -> Result<Vec<IpAddr>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rejects_invalid_names() {
+    #[tokio::test]
+    async fn rejects_invalid_names() {
         let ip: IpAddr = "192.168.1.10".parse().unwrap();
-        assert!(announce_ips("Bad.Name", &[ip]).is_err());
-        assert!(announce_ips("ok-name", &[]).is_err());
+        assert!(announce_ips("Bad.Name", &[ip]).await.is_err());
+        assert!(announce_ips("ok-name", &[]).await.is_err());
     }
 
     #[tokio::test]
     async fn builds_a_responder_for_valid_input() {
         let ip: IpAddr = "192.168.1.10".parse().unwrap();
-        let _responder = announce_ips("myapp", &[ip]).unwrap();
+        let _responder = announce_ips("myapp", &[ip]).await.unwrap();
     }
 }

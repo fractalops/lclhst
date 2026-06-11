@@ -149,7 +149,7 @@ pub async fn open(
     let _mdns_guard = if local_only {
         None
     } else {
-        match mdns::announce(&t.name) {
+        match mdns::announce(&t.name).await {
             Ok(g) => Some(g),
             Err(e) => {
                 eprintln!("warning: mDNS announce failed ({e}); LAN devices must use the IP");
@@ -179,7 +179,7 @@ async fn start_lan_edge<O: edge::Opener>(
     edge_port: u16,
 ) -> Result<SocketAddr> {
     let lan_ip = *mdns::lan_ips()?.first().expect("lan_ips is non-empty");
-    let responder = mdns::announce(name)?;
+    let responder = mdns::announce(name).await?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let name = name.to_string();
     tokio::spawn(async move {
