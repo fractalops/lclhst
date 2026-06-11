@@ -10,7 +10,7 @@ use hyper::body::Body;
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::protocol::{self, STATUS_OK};
 
@@ -176,6 +176,58 @@ fn error_page(status: StatusCode, tunnel_name: &str, detail: &str) -> Response<P
         .header("content-type", "text/html; charset=utf-8")
         .body(body)
         .expect("static response")
+}
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use hyper::service::service_fn;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio_rustls::TlsAcceptor;
+
+/// Serve the tunnel at https://<name>.localhost:<port> (127.0.0.1 only).
+/// Sends the bound address once listening (port 0 picks a free port — tests).
+pub async fn run<O: Opener>(
+    opener: O,
+    name: String,
+    port: u16,
+    ready: oneshot::Sender<SocketAddr>,
+) -> Result<()> {
+    let tls = TlsAcceptor::from(Arc::new(crate::tls::server_config(&name)?));
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{port}"))?;
+    let addr = listener.local_addr()?;
+    ready.send(addr).ok();
+
+    loop {
+        let (tcp, _) = listener.accept().await?;
+        let tls = tls.clone();
+        let opener = opener.clone();
+        let name = name.clone();
+        tokio::spawn(async move {
+            let stream = match tls.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("TLS handshake failed: {e}");
+                    return;
+                }
+            };
+            let service = service_fn(move |req| {
+                let opener = opener.clone();
+                let name = name.clone();
+                async move { Ok::<_, std::convert::Infallible>(handle_request(opener, name, req).await) }
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!("connection ended: {e}");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
