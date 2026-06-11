@@ -71,6 +71,26 @@ impl Opener for TunnelClient {
     }
 }
 
+/// Opener that skips the tunnel entirely: each open is a TCP connection to
+/// a port on this machine. This is what serves the LAN on the `serve` side,
+/// where the target is local and no QUIC hop exists.
+#[derive(Clone)]
+pub struct DirectOpener {
+    pub port: u16,
+}
+
+impl Opener for DirectOpener {
+    type R = tokio::net::tcp::OwnedReadHalf;
+    type W = tokio::net::tcp::OwnedWriteHalf;
+
+    async fn open(&self) -> Result<(Self::R, Self::W)> {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .with_context(|| format!("the app on port {} is not reachable", self.port))?;
+        Ok(tcp.into_split())
+    }
+}
+
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// Proxy one request through the tunnel. Infallible: failures become
@@ -186,18 +206,20 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
-/// Serve the tunnel at https://<name>.localhost:<port> (127.0.0.1 only).
+/// Serve an opener over HTTPS at `bind`. With a loopback bind the share is
+/// reachable as https://<name>.localhost:<port>; with an unspecified bind
+/// (0.0.0.0) the LAN can reach it as https://<name>.local:<port> (mDNS).
 /// Sends the bound address once listening (port 0 picks a free port — tests).
 pub async fn run<O: Opener>(
     opener: O,
     name: String,
-    port: u16,
+    bind: SocketAddr,
     ready: oneshot::Sender<SocketAddr>,
 ) -> Result<()> {
     let tls = TlsAcceptor::from(Arc::new(crate::tls::server_config(&name)?));
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    let listener = TcpListener::bind(bind)
         .await
-        .with_context(|| format!("binding 127.0.0.1:{port}"))?;
+        .with_context(|| format!("binding {bind}"))?;
     let addr = listener.local_addr()?;
     ready.send(addr).ok();
 

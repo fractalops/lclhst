@@ -28,11 +28,18 @@ async fn hello_app() -> u16 {
 
 async fn start_tunnel(app_port: u16) -> std::net::SocketAddr {
     let (ticket_tx, ticket_rx) = oneshot::channel();
-    tokio::spawn(lclhst::serve(app_port, "myapp".to_string(), ticket_tx));
-    let ticket = ticket_rx.await.unwrap();
+    // local_only: tests must not bind 0.0.0.0 or chatter mDNS on CI networks
+    tokio::spawn(lclhst::serve(
+        lclhst::Target::Port(app_port),
+        "myapp".to_string(),
+        0,
+        true,
+        ticket_tx,
+    ));
+    let ticket = ticket_rx.await.unwrap().ticket;
 
     let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(lclhst::open(ticket, 0, ready_tx));
+    tokio::spawn(lclhst::open(ticket, 0, true, ready_tx));
     ready_rx.await.unwrap()
 }
 

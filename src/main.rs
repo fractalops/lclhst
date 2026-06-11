@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 #[command(
     name = "lclhst",
     version,
-    about = "Share a running localhost app peer-to-peer"
+    about = "Share local apps and folders with other devices — over the LAN or peer-to-peer"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -14,21 +14,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Share a local port; prints a ticket for the other side
+    /// Share a port (e.g. 3000) or a path (e.g. ./photos)
     Serve {
-        /// Local port the app is running on
+        /// What to share: a port something is listening on, or a file/folder
+        target: String,
+        /// Share name: becomes <name>.local on the LAN, <name>.localhost via open
+        #[arg(long)]
+        name: Option<String>,
+        /// Port for the LAN HTTPS edge
+        #[arg(long, default_value_t = 4433)]
         port: u16,
-        /// Tunnel name: becomes <name>.localhost on the other side
-        #[arg(long, default_value = "app")]
-        name: String,
+        /// Don't expose anything on the LAN (ticket only)
+        #[arg(long)]
+        local_only: bool,
     },
-    /// Open a ticket; serves it at https://<name>.localhost:<port>
+    /// Open a ticket from another machine
     Open {
         /// Ticket from `lclhst serve`
         ticket: lclhst::ticket::Ticket,
         /// Local port for the HTTPS edge
         #[arg(long, default_value_t = 4433)]
         port: u16,
+        /// Bind loopback only; don't re-share on this machine's LAN
+        #[arg(long)]
+        local_only: bool,
     },
 }
 
@@ -39,23 +48,44 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { port, name } => {
+        Cmd::Serve {
+            target,
+            name,
+            port,
+            local_only,
+        } => {
+            let target = lclhst::Target::parse(&target)?;
+            let name = name.unwrap_or_else(|| target.default_name());
+            let display_name = name.clone();
             let (tx, rx) = oneshot::channel();
-            let task = tokio::spawn(lclhst::serve(port, name, tx));
-            if let Ok(ticket) = rx.await {
-                eprintln!("ticket: {ticket}");
-                eprintln!("on the other machine: lclhst open {ticket}");
-                eprintln!("waiting for peers — Ctrl-C to stop");
+            let task = tokio::spawn(lclhst::serve(target, name, port, local_only, tx));
+            if let Ok(info) = rx.await {
+                eprintln!("ticket: {}", info.ticket);
+                eprintln!("on another machine: lclhst open {}", info.ticket);
+                if let Some(lan) = info.lan {
+                    eprintln!(
+                        "on this network:    https://{display_name}.local:{} (or https://{lan})",
+                        lan.port()
+                    );
+                }
+                eprintln!("Ctrl-C to stop");
             }
             race_ctrl_c(task).await
         }
-        Cmd::Open { ticket, port } => {
+        Cmd::Open {
+            ticket,
+            port,
+            local_only,
+        } => {
             let name = ticket.name.clone();
             let (tx, rx) = oneshot::channel();
-            let task = tokio::spawn(lclhst::open(ticket, port, tx));
+            let task = tokio::spawn(lclhst::open(ticket, port, local_only, tx));
             if let Ok(addr) = rx.await {
-                eprintln!("serving {name} → https://{name}.localhost:{}", addr.port());
-                eprintln!("(self-signed cert in v0.1 — your browser will warn; curl -k works)");
+                eprintln!("this machine:    https://{name}.localhost:{}", addr.port());
+                if !local_only {
+                    eprintln!("on this network: https://{name}.local:{}", addr.port());
+                }
+                eprintln!("(self-signed cert — your browser will warn; curl -k works)");
             }
             race_ctrl_c(task).await
         }
