@@ -2,6 +2,7 @@
 
 pub mod edge;
 pub mod fileserve;
+pub mod mdns;
 pub mod protocol;
 pub mod splice;
 pub mod target;
