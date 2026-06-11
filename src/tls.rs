@@ -1,5 +1,6 @@
-//! TLS for the edge: a self-signed cert for `<name>.localhost` (v0.1).
-//! v0.2 replaces this with a local CA + trust installation.
+//! TLS for the edge: a self-signed cert covering `<name>.localhost` (this
+//! machine) and `<name>.local` (the LAN, resolved via mDNS). A local CA with
+//! trust installation replaces this in a later milestone.
 
 use anyhow::{Result, ensure};
 use rustls::pki_types::PrivateKeyDer;
@@ -8,7 +9,11 @@ use crate::protocol::valid_name;
 
 pub fn server_config(name: &str) -> Result<rustls::ServerConfig> {
     ensure!(valid_name(name), "invalid tunnel name: {name:?}");
-    let sans = vec![format!("{name}.localhost"), "localhost".to_string()];
+    let sans = vec![
+        format!("{name}.localhost"),
+        format!("{name}.local"),
+        "localhost".to_string(),
+    ];
     let ck = rcgen::generate_simple_self_signed(sans)?;
     let cert = ck.cert.der().clone();
     let key = PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());

@@ -23,8 +23,8 @@ v0.1 uses a self-signed certificate: browsers warn (click through), `curl -k` is
 A local CA with trust installation is the v0.2 headline.
 
 Inspired by [localias](https://github.com/peterldowns/localias) and
-[sendme](https://github.com/n0-computer/sendme). See `SPEC.md` for the design and
-`docs/commits.md` for the commit-message convention.
+[sendme](https://github.com/n0-computer/sendme). See `docs/commits.md` for the
+commit-message convention.
 
 ## Install
 
