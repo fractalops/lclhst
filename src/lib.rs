@@ -2,6 +2,7 @@
 
 pub mod protocol;
 pub mod splice;
+pub mod target;
 pub mod ticket;
 pub mod tls;
 pub mod tunnel;
