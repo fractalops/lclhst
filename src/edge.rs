@@ -229,6 +229,18 @@ pub async fn run<O: Opener>(
         let opener = opener.clone();
         let name = name.clone();
         tokio::spawn(async move {
+            // Browsers given a bare host:port try plain http first. A TLS
+            // record always starts with 0x16 (handshake); anything else is
+            // plaintext — answer it with a redirect to https.
+            let mut first = [0u8; 1];
+            match tcp.peek(&mut first).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) if first[0] != 0x16 => {
+                    redirect_to_https(tcp, &name).await;
+                    return;
+                }
+                Ok(_) => {}
+            }
             let stream = match tls.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -250,6 +262,39 @@ pub async fn run<O: Opener>(
             }
         });
     }
+}
+
+/// Answer one plaintext HTTP request with a 301 to the same host over https.
+async fn redirect_to_https(mut tcp: tokio::net::TcpStream, name: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; 4096];
+    let Ok(n) = tcp.read(&mut buf).await else {
+        return;
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let path = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or("/");
+    // Preserve whatever host:port the client used; it serves https too.
+    let host = head
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("Host: ")
+                .or_else(|| l.strip_prefix("host: "))
+        })
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{name}.local"));
+    let resp = format!(
+        "HTTP/1.1 301 Moved Permanently\r\nlocation: https://{host}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    );
+    tcp.write_all(resp.as_bytes()).await.ok();
+    tcp.shutdown().await.ok();
 }
 
 #[cfg(test)]
@@ -340,6 +385,39 @@ mod tests {
         assert!(
             text.contains("myapp"),
             "502 page should name the tunnel: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_gets_redirected_to_https() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(run(
+            LocalOpener { port: 1 }, // never dialed: redirect happens first
+            "myapp".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            ready_tx,
+        ));
+        let addr = ready_rx.await.unwrap();
+
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(
+            format!(
+                "GET /sub/page?x=1 HTTP/1.1\r\nHost: myapp.local:{}\r\n\r\n",
+                addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut resp = String::new();
+        tcp.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 301"), "{resp}");
+        assert!(
+            resp.contains(&format!(
+                "location: https://myapp.local:{}/sub/page?x=1",
+                addr.port()
+            )),
+            "{resp}"
         );
     }
 }

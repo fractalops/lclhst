@@ -180,22 +180,26 @@ async fn start_lan_edge<O: edge::Opener>(
 ) -> Result<SocketAddr> {
     let lan_ip = *mdns::lan_ips()?.first().expect("lan_ips is non-empty");
     let (ready_tx, ready_rx) = oneshot::channel();
-    let edge_name = name.to_string();
-    let edge_task = tokio::spawn(async move {
-        if let Err(e) = edge::run(
-            opener,
-            edge_name,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port),
-            ready_tx,
-        )
-        .await
-        {
-            tracing::warn!("LAN edge stopped: {e}");
+    let mut edge_task = tokio::spawn(edge::run(
+        opener,
+        name.to_string(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port),
+        ready_tx,
+    ));
+    // Either the edge reports its address, or it died on startup — in which
+    // case surface the real error (e.g. "binding 0.0.0.0:4433: address in
+    // use"), not a generic failure.
+    let bound = tokio::select! {
+        bound = ready_rx => bound.map_err(|_| anyhow::anyhow!("LAN edge exited before binding"))?,
+        res = &mut edge_task => {
+            let detail = match res {
+                Ok(Err(e)) => format!("{e:#}"),
+                Ok(Ok(())) => "edge exited unexpectedly".to_string(),
+                Err(e) => format!("edge task panicked: {e}"),
+            };
+            anyhow::bail!("{detail}");
         }
-    });
-    let bound = ready_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("LAN edge failed to start"))?;
+    };
     // Announce only once the edge is actually listening, with the real port.
     let responder = mdns::announce(name, bound.port())?;
     tokio::spawn(async move {
