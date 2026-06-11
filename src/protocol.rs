@@ -40,6 +40,9 @@ pub async fn write_hello<W: AsyncWrite + Unpin>(w: &mut W, name: &str) -> Result
     ensure!(valid_name(name), "invalid tunnel name: {name:?}");
     w.write_all(&[VERSION, name.len() as u8]).await?;
     w.write_all(name.as_bytes()).await?;
+    // noq's SendStream buffers; the hello must actually reach the far
+    // side before the peer can answer with a status byte.
+    w.flush().await?;
     Ok(())
 }
 
