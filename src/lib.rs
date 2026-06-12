@@ -159,6 +159,10 @@ pub async fn open(
     };
     let listener = edge::bind(bind_ip, edge_port).await?;
     let addr = listener.local_addr()?;
+    if addr.port() == 443 && !local_only {
+        // Plain http://<name>.local then lands on the redirect/onboarding.
+        edge::spawn_port_80_helper(bind_ip, t.name.clone(), ca.cert_pem().to_string());
+    }
 
     let _mdns_guard = if local_only {
         None
@@ -192,6 +196,14 @@ async fn start_lan_edge<O: edge::Opener>(
     let tls = edge::EdgeTls::new(ca.server_config(name, &lan_ips)?, ca.cert_pem().to_string());
     let listener = edge::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port).await?;
     let bound = listener.local_addr()?;
+    if bound.port() == 443 {
+        // Plain http://<name>.local then lands on the redirect/onboarding.
+        edge::spawn_port_80_helper(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            name.to_string(),
+            ca.cert_pem().to_string(),
+        );
+    }
     let responder = mdns::announce(name, bound.port())?;
     let name = name.to_string();
     tokio::spawn(async move {

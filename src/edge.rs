@@ -244,6 +244,40 @@ pub async fn bind(ip: std::net::IpAddr, port: Option<u16>) -> Result<TcpListener
     Err(anyhow::anyhow!(e)).with_context(|| format!("binding {ip}:{p}"))
 }
 
+/// When the https edge holds 443, also answer plain http on port 80:
+/// `http://<name>.local/` then redirects to https and
+/// `http://<name>.local/.lclhst/` serves the trust-onboarding page.
+/// Best-effort — returns false (and the edge works fine without it)
+/// when 80 can't be bound.
+pub fn spawn_port_80_helper(ip: std::net::IpAddr, name: String, ca_pem: String) -> bool {
+    let std_listener = match std::net::TcpListener::bind(SocketAddr::new(ip, 80)) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!("no port-80 helper: {e}");
+            return false;
+        }
+    };
+    if std_listener.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let Ok(listener) = TcpListener::from_std(std_listener) else {
+        return false;
+    };
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let name = name.clone();
+            let ca_pem = ca_pem.clone();
+            tokio::spawn(async move {
+                serve_plaintext(tcp, &name, &ca_pem).await;
+            });
+        }
+    });
+    true
+}
+
 /// Serve an opener over HTTPS on an already-bound listener. With a loopback
 /// bind the share is reachable as https://<name>.localhost:<port>; with an
 /// unspecified bind (0.0.0.0) the LAN can reach it as
