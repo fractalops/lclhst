@@ -86,7 +86,7 @@ pub struct ServeInfo {
 pub async fn serve(
     target: Target,
     name: String,
-    edge_port: u16,
+    edge_port: Option<u16>,
     local_only: bool,
     ca: ca::Ca,
     info_tx: oneshot::Sender<ServeInfo>,
@@ -137,7 +137,7 @@ pub async fn serve(
 /// devices on this machine's network.
 pub async fn open(
     t: ticket::Ticket,
-    edge_port: u16,
+    edge_port: Option<u16>,
     local_only: bool,
     ca: ca::Ca,
     ready_tx: oneshot::Sender<SocketAddr>,
@@ -149,17 +149,6 @@ pub async fn open(
         .map_err(|e| anyhow::anyhow!("could not reach the serving side (stale ticket?): {e}"))?;
     let opener = edge::TunnelClient::new(conn, t.name.clone());
 
-    let _mdns_guard = if local_only {
-        None
-    } else {
-        match mdns::announce(&t.name, edge_port) {
-            Ok(g) => Some(g),
-            Err(e) => {
-                eprintln!("warning: mDNS announce failed ({e}); LAN devices must use the IP");
-                None
-            }
-        }
-    };
     let (bind_ip, cert_ips) = if local_only {
         (IpAddr::V4(Ipv4Addr::LOCALHOST), Vec::new())
     } else {
@@ -168,18 +157,26 @@ pub async fn open(
             mdns::lan_ips().unwrap_or_default(),
         )
     };
+    let listener = edge::bind(bind_ip, edge_port).await?;
+    let addr = listener.local_addr()?;
+
+    let _mdns_guard = if local_only {
+        None
+    } else {
+        match mdns::announce(&t.name, addr.port()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("warning: mDNS announce failed ({e}); LAN devices must use the IP");
+                None
+            }
+        }
+    };
     let tls = edge::EdgeTls::new(
         ca.server_config(&t.name, &cert_ips)?,
         ca.cert_pem().to_string(),
     );
-    edge::run(
-        opener,
-        t.name,
-        SocketAddr::new(bind_ip, edge_port),
-        ready_tx,
-        tls,
-    )
-    .await
+    ready_tx.send(addr).ok();
+    edge::run(opener, t.name, listener, tls).await
 }
 
 /// Bind an edge on all interfaces and announce its name over mDNS.
@@ -187,41 +184,23 @@ pub async fn open(
 async fn start_lan_edge<O: edge::Opener>(
     opener: O,
     name: &str,
-    edge_port: u16,
+    edge_port: Option<u16>,
     ca: &ca::Ca,
 ) -> Result<SocketAddr> {
     let lan_ips = mdns::lan_ips()?;
     let lan_ip = *lan_ips.first().expect("lan_ips is non-empty");
     let tls = edge::EdgeTls::new(ca.server_config(name, &lan_ips)?, ca.cert_pem().to_string());
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let mut edge_task = tokio::spawn(edge::run(
-        opener,
-        name.to_string(),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port),
-        ready_tx,
-        tls,
-    ));
-    // Either the edge reports its address, or it died on startup — in which
-    // case surface the real error (e.g. "binding 0.0.0.0:4433: address in
-    // use"), not a generic failure.
-    let bound = tokio::select! {
-        bound = ready_rx => bound.map_err(|_| anyhow::anyhow!("LAN edge exited before binding"))?,
-        res = &mut edge_task => {
-            let detail = match res {
-                Ok(Err(e)) => format!("{e:#}"),
-                Ok(Ok(())) => "edge exited unexpectedly".to_string(),
-                Err(e) => format!("edge task panicked: {e}"),
-            };
-            anyhow::bail!("{detail}");
-        }
-    };
-    // Announce only once the edge is actually listening, with the real port.
+    let listener = edge::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port).await?;
+    let bound = listener.local_addr()?;
     let responder = mdns::announce(name, bound.port())?;
+    let name = name.to_string();
     tokio::spawn(async move {
-        // Tie the registration's lifetime to the edge: dropping the guard
-        // unregisters the name.
+        // The mDNS registration lives exactly as long as the edge: dropping
+        // the guard unregisters the name.
         let _responder = responder;
-        edge_task.await.ok();
+        if let Err(e) = edge::run(opener, name, listener, tls).await {
+            tracing::warn!("LAN edge stopped: {e}");
+        }
     });
     Ok(SocketAddr::new(lan_ip, bound.port()))
 }

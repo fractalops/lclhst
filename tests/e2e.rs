@@ -40,7 +40,7 @@ async fn start_tunnel(tag: &str, app_port: u16) -> (std::net::SocketAddr, reqwes
     tokio::spawn(lclhst::serve(
         lclhst::Target::Port(app_port),
         "myapp".to_string(),
-        0,
+        Some(0),
         true,
         test_ca(&format!("{tag}-serve")),
         ticket_tx,
@@ -50,7 +50,7 @@ async fn start_tunnel(tag: &str, app_port: u16) -> (std::net::SocketAddr, reqwes
     let open_ca = test_ca(&format!("{tag}-open"));
     let ca_pem = open_ca.cert_pem().to_string();
     let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(lclhst::open(ticket, 0, true, open_ca, ready_tx));
+    tokio::spawn(lclhst::open(ticket, Some(0), true, open_ca, ready_tx));
     let addr = ready_rx.await.unwrap();
 
     let client = reqwest::Client::builder()

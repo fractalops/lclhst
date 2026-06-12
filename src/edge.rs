@@ -203,7 +203,6 @@ use std::sync::Arc;
 
 use hyper::service::service_fn;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 /// TLS material for an edge: the CA-minted server config plus the CA
@@ -223,23 +222,39 @@ impl EdgeTls {
     }
 }
 
-/// Serve an opener over HTTPS at `bind`. With a loopback bind the share is
-/// reachable as https://<name>.localhost:<port>; with an unspecified bind
-/// (0.0.0.0) the LAN can reach it as https://<name>.local:<port> (mDNS).
-/// Sends the bound address once listening (port 0 picks a free port — tests).
+/// Bind a listener for an edge, trying each port in order. `None` means
+/// auto: 443 first (bare https URLs — works unprivileged on macOS), then
+/// the registered fallback 4433.
+pub async fn bind(ip: std::net::IpAddr, port: Option<u16>) -> Result<TcpListener> {
+    let candidates: &[u16] = match port {
+        Some(p) => &[p],
+        None => &[443, 4433],
+    };
+    let mut last_err = None;
+    for &p in candidates {
+        match TcpListener::bind(SocketAddr::new(ip, p)).await {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                tracing::debug!("could not bind {ip}:{p}: {e}");
+                last_err = Some((p, e));
+            }
+        }
+    }
+    let (p, e) = last_err.expect("at least one candidate");
+    Err(anyhow::anyhow!(e)).with_context(|| format!("binding {ip}:{p}"))
+}
+
+/// Serve an opener over HTTPS on an already-bound listener. With a loopback
+/// bind the share is reachable as https://<name>.localhost:<port>; with an
+/// unspecified bind (0.0.0.0) the LAN can reach it as
+/// https://<name>.local:<port> (mDNS).
 pub async fn run<O: Opener>(
     opener: O,
     name: String,
-    bind: SocketAddr,
-    ready: oneshot::Sender<SocketAddr>,
+    listener: TcpListener,
     tls: EdgeTls,
 ) -> Result<()> {
     let acceptor = TlsAcceptor::from(tls.config.clone());
-    let listener = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding {bind}"))?;
-    let addr = listener.local_addr()?;
-    ready.send(addr).ok();
 
     loop {
         let (tcp, _) = listener.accept().await?;
@@ -506,15 +521,15 @@ mod tests {
     }
 
     async fn start_edge() -> std::net::SocketAddr {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let listener = bind("127.0.0.1".parse().unwrap(), Some(0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
         tokio::spawn(run(
             LocalOpener { port: 1 }, // never dialed in these tests
             "myapp".to_string(),
-            "127.0.0.1:0".parse().unwrap(),
-            ready_tx,
+            listener,
             test_tls(),
         ));
-        ready_rx.await.unwrap()
+        addr
     }
 
     async fn plaintext_request(addr: std::net::SocketAddr, path: &str) -> String {

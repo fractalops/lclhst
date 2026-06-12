@@ -13,6 +13,7 @@ categories = ["network-programming", "command-line-utilities"]
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+fast_qr = "0.13.1"
 futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server", "client"] }
