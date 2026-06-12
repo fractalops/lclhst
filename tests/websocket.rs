@@ -29,17 +29,22 @@ async fn websocket_echo_through_tunnel() {
     let app_port = ws_echo_app().await;
 
     let (ticket_tx, ticket_rx) = oneshot::channel();
+    fn test_ca(tag: &str) -> lclhst::ca::Ca {
+        let dir = std::env::temp_dir().join(format!("lclhst-ws-ca-{tag}-{}", std::process::id()));
+        lclhst::ca::Ca::load_or_create(&dir).unwrap()
+    }
     // local_only: tests must not bind 0.0.0.0 or chatter mDNS on CI networks
     tokio::spawn(lclhst::serve(
         lclhst::Target::Port(app_port),
         "myapp".to_string(),
         0,
         true,
+        test_ca("serve"),
         ticket_tx,
     ));
     let ticket = ticket_rx.await.unwrap().ticket;
     let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(lclhst::open(ticket, 0, true, ready_tx));
+    tokio::spawn(lclhst::open(ticket, 0, true, test_ca("open"), ready_tx));
     let edge_addr = ready_rx.await.unwrap();
 
     // TLS client that trusts anything (v0.1 self-signed edge cert)

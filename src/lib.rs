@@ -1,6 +1,7 @@
 //! lclhst — share local apps and folders with other devices, over the LAN
 //! or peer-to-peer, with no server in the middle.
 
+pub mod ca;
 pub mod edge;
 pub mod fileserve;
 pub mod mdns;
@@ -8,7 +9,7 @@ pub mod protocol;
 pub mod splice;
 pub mod target;
 pub mod ticket;
-pub mod tls;
+pub mod trust;
 pub mod tunnel;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -87,6 +88,7 @@ pub async fn serve(
     name: String,
     edge_port: u16,
     local_only: bool,
+    ca: ca::Ca,
     info_tx: oneshot::Sender<ServeInfo>,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -117,7 +119,7 @@ pub async fn serve(
     let lan = if local_only {
         None
     } else {
-        match start_lan_edge(edge::DirectOpener { port }, &name, edge_port).await {
+        match start_lan_edge(edge::DirectOpener { port }, &name, edge_port, &ca).await {
             Ok(addr) => Some(addr),
             Err(e) => {
                 eprintln!("warning: LAN exposure failed ({e}); continuing with ticket only");
@@ -137,6 +139,7 @@ pub async fn open(
     t: ticket::Ticket,
     edge_port: u16,
     local_only: bool,
+    ca: ca::Ca,
     ready_tx: oneshot::Sender<SocketAddr>,
 ) -> Result<()> {
     let endpoint = tunnel::open_endpoint().await?;
@@ -157,16 +160,24 @@ pub async fn open(
             }
         }
     };
-    let bind_ip = if local_only {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    let (bind_ip, cert_ips) = if local_only {
+        (IpAddr::V4(Ipv4Addr::LOCALHOST), Vec::new())
     } else {
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        (
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            mdns::lan_ips().unwrap_or_default(),
+        )
     };
+    let tls = edge::EdgeTls::new(
+        ca.server_config(&t.name, &cert_ips)?,
+        ca.cert_pem().to_string(),
+    );
     edge::run(
         opener,
         t.name,
         SocketAddr::new(bind_ip, edge_port),
         ready_tx,
+        tls,
     )
     .await
 }
@@ -177,14 +188,18 @@ async fn start_lan_edge<O: edge::Opener>(
     opener: O,
     name: &str,
     edge_port: u16,
+    ca: &ca::Ca,
 ) -> Result<SocketAddr> {
-    let lan_ip = *mdns::lan_ips()?.first().expect("lan_ips is non-empty");
+    let lan_ips = mdns::lan_ips()?;
+    let lan_ip = *lan_ips.first().expect("lan_ips is non-empty");
+    let tls = edge::EdgeTls::new(ca.server_config(name, &lan_ips)?, ca.cert_pem().to_string());
     let (ready_tx, ready_rx) = oneshot::channel();
     let mut edge_task = tokio::spawn(edge::run(
         opener,
         name.to_string(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), edge_port),
         ready_tx,
+        tls,
     ));
     // Either the edge reports its address, or it died on startup — in which
     // case surface the real error (e.g. "binding 0.0.0.0:4433: address in

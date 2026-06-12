@@ -39,6 +39,8 @@ enum Cmd {
         #[arg(long)]
         local_only: bool,
     },
+    /// Install this machine's lclhst CA into the system trust store
+    Trust,
 }
 
 #[tokio::main]
@@ -57,14 +59,19 @@ async fn main() -> anyhow::Result<()> {
             let target = lclhst::Target::parse(&target)?;
             let name = name.unwrap_or_else(|| target.default_name());
             let display_name = name.clone();
+            let ca = lclhst::ca::Ca::load_or_create(&lclhst::ca::Ca::default_dir())?;
             let (tx, rx) = oneshot::channel();
-            let task = tokio::spawn(lclhst::serve(target, name, port, local_only, tx));
+            let task = tokio::spawn(lclhst::serve(target, name, port, local_only, ca, tx));
             if let Ok(info) = rx.await {
                 eprintln!("ticket: {}", info.ticket);
                 eprintln!("on another machine: lclhst open {}", info.ticket);
                 if let Some(lan) = info.lan {
                     eprintln!(
                         "on this network:    https://{display_name}.local:{} (or https://{lan})",
+                        lan.port()
+                    );
+                    eprintln!(
+                        "trust on a phone:   http://{display_name}.local:{}/.lclhst/",
                         lan.port()
                     );
                 }
@@ -78,16 +85,27 @@ async fn main() -> anyhow::Result<()> {
             local_only,
         } => {
             let name = ticket.name.clone();
+            let ca = lclhst::ca::Ca::load_or_create(&lclhst::ca::Ca::default_dir())?;
             let (tx, rx) = oneshot::channel();
-            let task = tokio::spawn(lclhst::open(ticket, port, local_only, tx));
+            let task = tokio::spawn(lclhst::open(ticket, port, local_only, ca, tx));
             if let Ok(addr) = rx.await {
                 eprintln!("this machine:    https://{name}.localhost:{}", addr.port());
                 if !local_only {
                     eprintln!("on this network: https://{name}.local:{}", addr.port());
+                    eprintln!(
+                        "trust on a phone: http://{name}.local:{}/.lclhst/",
+                        addr.port()
+                    );
                 }
-                eprintln!("(self-signed cert — your browser will warn; curl -k works)");
+                eprintln!("(run `lclhst trust` once on this machine for a clean padlock)");
             }
             race_ctrl_c(task).await
+        }
+        Cmd::Trust => {
+            let dir = lclhst::ca::Ca::default_dir();
+            // Ensure the CA exists before installing it.
+            lclhst::ca::Ca::load_or_create(&dir)?;
+            lclhst::trust::install(&dir.join("rootCA.pem"))
         }
     }
 }

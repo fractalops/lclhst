@@ -206,6 +206,23 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
+/// TLS material for an edge: the CA-minted server config plus the CA
+/// certificate itself, served on the onboarding route.
+#[derive(Clone)]
+pub struct EdgeTls {
+    pub config: Arc<rustls::ServerConfig>,
+    pub ca_pem: String,
+}
+
+impl EdgeTls {
+    pub fn new(config: rustls::ServerConfig, ca_pem: String) -> Self {
+        Self {
+            config: Arc::new(config),
+            ca_pem,
+        }
+    }
+}
+
 /// Serve an opener over HTTPS at `bind`. With a loopback bind the share is
 /// reachable as https://<name>.localhost:<port>; with an unspecified bind
 /// (0.0.0.0) the LAN can reach it as https://<name>.local:<port> (mDNS).
@@ -215,8 +232,9 @@ pub async fn run<O: Opener>(
     name: String,
     bind: SocketAddr,
     ready: oneshot::Sender<SocketAddr>,
+    tls: EdgeTls,
 ) -> Result<()> {
-    let tls = TlsAcceptor::from(Arc::new(crate::tls::server_config(&name)?));
+    let acceptor = TlsAcceptor::from(tls.config.clone());
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
@@ -225,23 +243,24 @@ pub async fn run<O: Opener>(
 
     loop {
         let (tcp, _) = listener.accept().await?;
-        let tls = tls.clone();
+        let acceptor = acceptor.clone();
         let opener = opener.clone();
         let name = name.clone();
+        let ca_pem = tls.ca_pem.clone();
         tokio::spawn(async move {
             // Browsers given a bare host:port try plain http first. A TLS
             // record always starts with 0x16 (handshake); anything else is
-            // plaintext — answer it with a redirect to https.
+            // plaintext — serve onboarding routes or redirect to https.
             let mut first = [0u8; 1];
             match tcp.peek(&mut first).await {
                 Ok(0) | Err(_) => return,
                 Ok(_) if first[0] != 0x16 => {
-                    redirect_to_https(tcp, &name).await;
+                    serve_plaintext(tcp, &name, &ca_pem).await;
                     return;
                 }
                 Ok(_) => {}
             }
-            let stream = match tls.accept(tcp).await {
+            let stream = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!("TLS handshake failed: {e}");
@@ -251,7 +270,14 @@ pub async fn run<O: Opener>(
             let service = service_fn(move |req| {
                 let opener = opener.clone();
                 let name = name.clone();
-                async move { Ok::<_, std::convert::Infallible>(handle_request(opener, name, req).await) }
+                let ca_pem = ca_pem.clone();
+                async move {
+                    let resp = match onboarding_response(req.uri().path(), &name, &ca_pem) {
+                        Some(resp) => resp,
+                        None => handle_request(opener, name, req).await,
+                    };
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -264,8 +290,71 @@ pub async fn run<O: Opener>(
     }
 }
 
-/// Answer one plaintext HTTP request with a 301 to the same host over https.
-async fn redirect_to_https(mut tcp: tokio::net::TcpStream, name: &str) {
+/// The reserved path prefix for lclhst's own pages (CA download, help).
+const ONBOARDING_PREFIX: &str = "/.lclhst";
+
+/// Responses for the reserved `/.lclhst/` routes, or None to proxy normally.
+fn onboarding_response(path: &str, name: &str, ca_pem: &str) -> Option<Response<ProxyBody>> {
+    let body = |bytes: Bytes| {
+        Full::new(bytes)
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed()
+    };
+    match path {
+        "/.lclhst/ca" => Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                // This mime type makes iOS offer profile installation and
+                // Android offer CA installation on tap.
+                .header("content-type", "application/x-x509-ca-cert")
+                .header(
+                    "content-disposition",
+                    "attachment; filename=\"lclhst-ca.crt\"",
+                )
+                .body(body(Bytes::from(ca_pem.to_string())))
+                .expect("static response"),
+        ),
+        "/.lclhst" | "/.lclhst/" => Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/html; charset=utf-8")
+                .body(body(Bytes::from(onboarding_page(name))))
+                .expect("static response"),
+        ),
+        _ => None,
+    }
+}
+
+fn onboarding_page(name: &str) -> String {
+    format!(
+        "<!doctype html><html><head><title>trust this device — lclhst</title>\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <style>body{{font-family:system-ui;max-width:36rem;margin:2rem auto;padding:0 1rem;color:#333}}\
+         code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:4px}}\
+         a.button{{display:inline-block;background:#0a7;color:#fff;padding:.6rem 1.2rem;\
+         border-radius:8px;text-decoration:none;margin:.5rem 0}}</style></head>\
+         <body><h2>Trust this device once, browse without warnings</h2>\
+         <p><code>{name}</code> is shared via lclhst. Its certificates are signed by a\
+         private authority on the sharing machine. Install that authority once and\
+         every lclhst share from it gets a normal padlock.</p>\
+         <p><a class=\"button\" href=\"/.lclhst/ca\">Download the certificate</a></p>\
+         <p><strong>iPhone/iPad:</strong> after downloading, Settings → General →\
+         VPN &amp; Device Management → install the profile, then Settings → General →\
+         About → Certificate Trust Settings → enable full trust.</p>\
+         <p><strong>Android:</strong> after downloading, tap the file (or Settings →\
+         Security → Install a certificate → CA certificate).</p>\
+         <p><strong>Mac/Linux:</strong> run <code>lclhst trust</code> on the machine\
+         that serves, or import the downloaded file into your trust store.</p>\
+         <p>Skipping this is fine too — traffic is encrypted either way; your browser\
+         just can't verify who it's talking to, so it shows a warning.</p>\
+         </body></html>"
+    )
+}
+
+/// Answer one plaintext HTTP request: onboarding routes are served directly
+/// (a device can't fetch the CA over https before trusting it); everything
+/// else gets a 301 to the same host over https.
+async fn serve_plaintext(mut tcp: tokio::net::TcpStream, name: &str, ca_pem: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = vec![0u8; 4096];
@@ -279,21 +368,40 @@ async fn redirect_to_https(mut tcp: tokio::net::TcpStream, name: &str) {
         .and_then(|l| l.split_whitespace().nth(1))
         .filter(|p| p.starts_with('/'))
         .unwrap_or("/");
-    // Preserve whatever host:port the client used; it serves https too.
-    let host = head
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("Host: ")
-                .or_else(|| l.strip_prefix("host: "))
-        })
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{name}.local"));
-    let resp = format!(
-        "HTTP/1.1 301 Moved Permanently\r\nlocation: https://{host}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-    );
-    tcp.write_all(resp.as_bytes()).await.ok();
+
+    let raw = if path == "/.lclhst/ca" {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-x509-ca-cert\r\n\
+             content-disposition: attachment; filename=\"lclhst-ca.crt\"\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{}",
+            ca_pem.len(),
+            ca_pem
+        )
+    } else if path.starts_with(ONBOARDING_PREFIX) {
+        let page = onboarding_page(name);
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{}",
+            page.len(),
+            page
+        )
+    } else {
+        // Preserve whatever host:port the client used; it serves https too.
+        let host = head
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("Host: ")
+                    .or_else(|| l.strip_prefix("host: "))
+            })
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{name}.local"));
+        format!(
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: https://{host}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+    };
+    tcp.write_all(raw.as_bytes()).await.ok();
     tcp.shutdown().await.ok();
 }
 
@@ -388,21 +496,32 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn plain_http_gets_redirected_to_https() {
+    fn test_tls() -> EdgeTls {
+        let dir = std::env::temp_dir().join(format!("lclhst-edge-test-ca-{}", std::process::id()));
+        let ca = crate::ca::Ca::load_or_create(&dir).unwrap();
+        EdgeTls::new(
+            ca.server_config("myapp", &[]).unwrap(),
+            ca.cert_pem().to_string(),
+        )
+    }
+
+    async fn start_edge() -> std::net::SocketAddr {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(run(
-            LocalOpener { port: 1 }, // never dialed: redirect happens first
+            LocalOpener { port: 1 }, // never dialed in these tests
             "myapp".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             ready_tx,
+            test_tls(),
         ));
-        let addr = ready_rx.await.unwrap();
+        ready_rx.await.unwrap()
+    }
 
+    async fn plaintext_request(addr: std::net::SocketAddr, path: &str) -> String {
         let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         tcp.write_all(
             format!(
-                "GET /sub/page?x=1 HTTP/1.1\r\nHost: myapp.local:{}\r\n\r\n",
+                "GET {path} HTTP/1.1\r\nHost: myapp.local:{}\r\n\r\n",
                 addr.port()
             )
             .as_bytes(),
@@ -411,6 +530,24 @@ mod tests {
         .unwrap();
         let mut resp = String::new();
         tcp.read_to_string(&mut resp).await.unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn plain_http_serves_onboarding_routes() {
+        let addr = start_edge().await;
+        let ca = plaintext_request(addr, "/.lclhst/ca").await;
+        assert!(ca.starts_with("HTTP/1.1 200"), "{ca}");
+        assert!(ca.contains("-----BEGIN CERTIFICATE-----"), "{ca}");
+        let help = plaintext_request(addr, "/.lclhst/").await;
+        assert!(help.starts_with("HTTP/1.1 200"), "{help}");
+        assert!(help.contains("Trust this device"), "{help}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_gets_redirected_to_https() {
+        let addr = start_edge().await;
+        let resp = plaintext_request(addr, "/sub/page?x=1").await;
         assert!(resp.starts_with("HTTP/1.1 301"), "{resp}");
         assert!(
             resp.contains(&format!(
